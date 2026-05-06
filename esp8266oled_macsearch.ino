@@ -165,7 +165,7 @@ void loop() {
       display.setCursor(0, 0);
       display.println(ssid);
 
-      display.setCursor(0, 7);
+      display.setCursor(0, 8);
       display.println(targetMAC);
 
       display.setCursor(0, 18);
