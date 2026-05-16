@@ -6,7 +6,7 @@
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
+#define OLED_RESET -1
 
 #define SDA_PIN 14
 #define SCL_PIN 12
@@ -15,7 +15,14 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 ESP8266WebServer server(80);
 
 // ===== TARGET =====
-String targetMAC = "50:FF:20:BD:5A:D5";
+String targetMAC = "76:FF:FC:A2:D1:C5";
+
+// ===== SPEED =====
+const unsigned long SCAN_INTERVAL = 500; // быстрее чем раньше
+
+// ===== CALIBRATION =====
+float A = -45.0;
+float n = 2.6;
 
 // ===== STATE =====
 bool targetFound = false;
@@ -26,63 +33,78 @@ int lastRSSI = -100;
 String trend = "-----";
 
 unsigned long lastScanTime = 0;
-const unsigned long SCAN_INTERVAL = 1000;
 
-// ===== RSSI SMOOTH =====
-int smoothRSSI(int newValue) {
-  static int buffer[5] = {-100, -100, -100, -100, -100};
-  static int index = 0;
+// ===== SMOOTH (6 samples) =====
+int buffer[6];
+int idx = 0;
+bool full = false;
 
-  buffer[index++] = newValue;
-  if(index >= 5) index = 0;
+int smoothRSSI(int v) {
+  buffer[idx++] = v;
+  if(idx >= 6) {
+    idx = 0;
+    full = true;
+  }
 
+  int count = full ? 6 : idx;
   int sum = 0;
-  for(int i = 0; i < 5; i++) sum += buffer[i];
 
-  return sum / 5;
+  for(int i = 0; i < count; i++) sum += buffer[i];
+
+  return sum / count;
 }
 
-// ===== TREND =====
-void updateTrend(int currentRSSI) {
-  int delta = currentRSSI - lastRSSI;
+// ===== TREND FAST =====
+void updateTrend(int rssi) {
+  int d = rssi - lastRSSI;
 
-  if(delta > 2) trend = "^^^";
-  else if(delta < -2) trend = "vvv";
-  else trend = "---";
+  if(d > 1) trend = "^^^^^";
+  else if(d < -1) trend = "vvvvv";
+  else trend = "-----";
 
-  lastRSSI = currentRSSI;
+  lastRSSI = rssi;
 }
 
-// ===== BAR GRAPH =====
-void drawBar(int x, int y, int value) {
-  int bars = map(value, 0, 100, 0, 10);
+// ===== DISTANCE =====
+float calcDistance(int rssi) {
+  return pow(10.0, (A - rssi) / (10.0 * n));
+}
+
+// ===== BAR =====
+void drawBar(int x, int y, int val) {
+  int bars = map(val, 0, 100, 0, 10);
 
   display.setCursor(x, y);
   display.print("[");
 
   for(int i = 0; i < 10; i++) {
-    if(i < bars) display.print("#");
-    else display.print(" ");
+    display.print(i < bars ? "#" : " ");
   }
 
   display.print("]");
 }
 
-// ===== WEB UI =====
-void handleRoot() {
-  String html =
-    "<h2>WiFi Tracker</h2>"
-    "<form action='/set'>"
-    "MAC: <input name='mac' value='" + targetMAC + "'><br><br>"
-    "<input type='submit' value='Set MAC'>"
-    "</form>";
+// ===== WEB =====
+const char PAGE[] PROGMEM = R"rawliteral(
+<h3>RF Finder</h3>
+<p><b>MAC:</b> %MAC%</p>
+<form action="/set">
+<input name="mac">
+<br><br>
+<input type="submit" value="SET">
+</form>
+)rawliteral";
 
-  server.send(200, "text/html", html);
+void handleRoot() {
+  String page = PAGE;
+  page.replace("%MAC%", targetMAC);
+  server.send(200, "text/html", page);
 }
 
 void handleSet() {
   if(server.hasArg("mac")) {
     targetMAC = server.arg("mac");
+    targetMAC.toUpperCase();
   }
   server.sendHeader("Location", "/");
   server.send(303);
@@ -98,11 +120,9 @@ void setup() {
     for(;;);
   }
 
-  // WiFi scan mode
   WiFi.mode(WIFI_STA);
+  WiFi.softAP("RFFinder");
 
-  // WEB SERVER
-  WiFi.softAP("WiFiTracker");
   server.on("/", handleRoot);
   server.on("/set", handleSet);
   server.begin();
@@ -111,85 +131,99 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println("WiFi Tracker Ready");
+  display.println("RF Finder");
   display.display();
 
-  delay(1000);
+  delay(800);
 }
 
 // ===== LOOP =====
 void loop() {
   server.handleClient();
 
+  // ===== FAST SCAN =====
   if(millis() - lastScanTime >= SCAN_INTERVAL) {
     lastScanTime = millis();
 
-    int networks = WiFi.scanNetworks();
+    int n = WiFi.scanNetworks(false, true); // fast scan
 
     targetFound = false;
 
-    for(int i = 0; i < networks; i++) {
-      uint8_t* bssid = WiFi.BSSID(i);
+    for(int i = 0; i < n; i++) {
 
-      char mac[18];
-      snprintf(mac, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
-               bssid[0], bssid[1], bssid[2],
-               bssid[3], bssid[4], bssid[5]);
+      // фильтр слабых сигналов (ускоряет)
+      if(WiFi.RSSI(i) < -85) continue;
 
-      String currentMAC = String(mac);
+      String mac = WiFi.BSSIDstr(i);
+      mac.toUpperCase();
 
-      if(currentMAC == targetMAC) {
-        targetFound = true;
+      if(mac != targetMAC) continue;
 
-        targetSSID = WiFi.SSID(i);
-        if(targetSSID == "") targetSSID = "<hidden>";
+      targetFound = true;
 
-        int rawRSSI = WiFi.RSSI(i);
-        targetRSSI = smoothRSSI(rawRSSI);
+      targetSSID = WiFi.SSID(i);
+      if(targetSSID == "") targetSSID = "<hidden>";
 
-        updateTrend(targetRSSI);
-        break;
-      }
+      int raw = WiFi.RSSI(i);
+      targetRSSI = smoothRSSI(raw);
+
+      updateTrend(targetRSSI);
+
+      break; // ранний выход = быстрее
     }
 
-    // ===== DISPLAY =====
-    display.clearDisplay();
-    display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
-
-    if(targetFound) {
-
-      String ssid = targetSSID;
-      if(ssid.length() > 14) ssid = ssid.substring(0, 14);
-
-      display.setCursor(0, 0);
-      display.println(ssid);
-
-      display.setCursor(0, 8);
-      display.println(targetMAC);
-
-      display.setCursor(0, 18);
-      display.print("RSSI: ");
-      display.println(targetRSSI);
-
-      int strength = map(constrain(targetRSSI, -90, -30), -90, -30, 0, 100);
-      strength = constrain(strength, 0, 100);
-
-      display.setCursor(0, 28);
-      display.print("SIG:");
-
-      drawBar(30, 28, strength);
-
-      display.setCursor(0, 42);
-      display.setTextSize(2);
-      display.println(trend);
-
-    } else {
-      display.setCursor(0, 25);
-      display.println("TARGET NOT FOUND");
-    }
-
-    display.display();
     WiFi.scanDelete();
   }
+
+  // ===== DISPLAY =====
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if(targetFound) {
+
+    String ssid = targetSSID;
+    if(ssid.length() > 14) ssid = ssid.substring(0, 14);
+
+    display.setCursor(0, 0);
+    display.println(ssid);
+
+    display.setCursor(0, 7);
+    display.println(targetMAC);
+
+    display.setCursor(0, 18);
+    display.print("RSSI: ");
+    display.println(targetRSSI);
+
+    int sig = map(constrain(targetRSSI, -90, -30), -90, -30, 0, 100);
+    sig = constrain(sig, 0, 100);
+
+    display.setCursor(0, 28);
+    display.print("SIG:");
+    drawBar(30, 28, sig);
+
+    float dist = calcDistance(targetRSSI);
+
+    display.setCursor(0, 38);
+    display.print("D: ");
+    display.print(dist, 1);
+    display.println(" m");
+
+    display.setTextSize(2);
+    display.setCursor(10, 50);
+    display.println(trend);
+
+  } else {
+
+    display.setCursor(0, 0);
+    display.println("SEARCHING...");
+
+    display.setCursor(0, 10);
+    display.println(targetMAC);
+
+    display.setCursor(0, 25);
+    display.println("SEARCH MODE");
+  }
+
+  display.display();
 }
